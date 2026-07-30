@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 .env
 *.egg-info/
+
+# Trained model artifacts (regenerate with `logsentinel fit`)
+*.joblib
