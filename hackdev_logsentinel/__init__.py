@@ -9,4 +9,4 @@ requests relative to a trained baseline.
 Blue-team/defensive tool for logs you own or are authorized to access.
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"

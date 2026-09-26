@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hackdev-logsentinel"
+dynamic = ["version"]
+description = "ML-based web server log anomaly detector using Isolation Forest."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Raghubir Mahato" }]
+requires-python = ">=3.10"
+keywords = ["security", "blue-team", "log-analysis", "anomaly-detection", "isolation-forest"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: System :: Logging",
+]
+dependencies = [
+    "scikit-learn>=1.3.0",
+    "numpy>=1.24.0",
+    "joblib>=1.3.0",
+]
+
+[project.optional-dependencies]
+webhook = ["requests>=2.31.0"]
+
+[project.scripts]
+logsentinel = "hackdev_logsentinel.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/raghubirmahato/HackDev-LogSentinel"
+Issues = "https://github.com/raghubirmahato/HackDev-LogSentinel/issues"
+
+[tool.setuptools]
+packages = ["hackdev_logsentinel"]
+
+[tool.setuptools.dynamic]
+version = { attr = "hackdev_logsentinel.__version__" }
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I"]
