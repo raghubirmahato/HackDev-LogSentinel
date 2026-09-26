@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from dataclasses import asdict, dataclass
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl
 
 from .parsers import LogEntry
 
@@ -29,10 +29,7 @@ class RequestFeatures:
     method_encoded: int
 
     def to_vector(self) -> list[float]:
-        return [
-            float(self.url_length), float(self.param_count), float(self.special_char_ratio),
-            float(self.entropy), float(self.payload_length), float(self.method_encoded),
-        ]
+        return [float(getattr(self, name)) for name in FEATURE_ORDER]
 
     def to_dict(self) -> dict[str, float]:
         return asdict(self)
@@ -46,12 +43,22 @@ def shannon_entropy(s: str) -> float:
     return -sum((c / total) * math.log2(c / total) for c in counts.values())
 
 
+def query_string(target: str) -> str:
+    """The query component of a request target, split the same way as
+    urllib.parse.urlsplit (drop the #fragment, then take what follows the
+    first "?"). urlsplit itself isn't used because it raises ValueError on
+    inputs like "//[x" ("Invalid IPv6 URL") - request targets are
+    attacker-controlled, and one crafted request must not abort a scan."""
+    target = target.split("#", 1)[0]
+    return target.split("?", 1)[1] if "?" in target else ""
+
+
 def extract_features(entry: LogEntry) -> RequestFeatures:
-    split = urlsplit(entry.path)
+    query = query_string(entry.path)
     url_length = len(entry.path)
 
     try:
-        params = parse_qsl(split.query, keep_blank_values=True)
+        params = parse_qsl(query, keep_blank_values=True)
     except ValueError:
         params = []
     param_count = len(params)
@@ -62,7 +69,7 @@ def extract_features(entry: LogEntry) -> RequestFeatures:
     else:
         special_char_ratio = 0.0
 
-    entropy = shannon_entropy(split.query)
+    entropy = shannon_entropy(query)
     method_encoded = METHOD_ENCODING.get(entry.method.upper(), 6)
 
     return RequestFeatures(
