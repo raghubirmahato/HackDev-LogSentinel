@@ -20,6 +20,7 @@ from .model import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_CONTAMINATION,
     DEFAULT_MAX_FIT_ROWS,
+    DEFAULT_RANGE_FACTOR,
     EmptyBaselineError,
     ModelError,
     fit_incremental,
@@ -55,6 +56,16 @@ def _contamination(raw: str) -> float:
         raise argparse.ArgumentTypeError(f"invalid number: {raw!r}") from None
     if not 0 < value <= 0.5:
         raise argparse.ArgumentTypeError(f"must be in the range (0, 0.5], got {raw}")
+    return value
+
+
+def _range_factor(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid number: {raw!r}") from None
+    if not (value == 0 or 1 < value < float("inf")):
+        raise argparse.ArgumentTypeError(f"must be greater than 1, or 0 to turn the range check off; got {raw}")
     return value
 
 
@@ -131,10 +142,12 @@ def cmd_fit(args: argparse.Namespace) -> int:
     try:
         if existing is not None:
             bundle = fit_incremental(existing, features, contamination=args.contamination,
-                                     max_fit_rows=args.max_fit_rows)
+                                     max_fit_rows=args.max_fit_rows, range_factor=args.range_factor)
         else:
             contamination = DEFAULT_CONTAMINATION if args.contamination is None else args.contamination
-            bundle = fit_model(features, contamination=contamination, max_fit_rows=args.max_fit_rows)
+            range_factor = DEFAULT_RANGE_FACTOR if args.range_factor is None else args.range_factor
+            bundle = fit_model(features, contamination=contamination, max_fit_rows=args.max_fit_rows,
+                               range_factor=range_factor)
     except EmptyBaselineError:
         if stats.total_lines:
             _log_nothing_parsed(stats, baseline_path)
@@ -157,6 +170,8 @@ def cmd_fit(args: argparse.Namespace) -> int:
         "unparsed_lines": stats.unparsed_lines,
         "total_baseline_rows": bundle.n_samples_seen,
         "cached_sample_size": len(bundle.cached_sample),
+        "range_factor": bundle.range_factor,
+        "range_bounds": bundle.range_bounds,
     }
 
     if args.format == "json":
@@ -193,7 +208,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
             found += 1
             yield anomaly
 
-    flagged = counted(scan_stream(bundle, pairs, chunk_size=args.chunk_size))
+    range_factor = bundle.range_factor if args.range_factor is None else args.range_factor
+    flagged = counted(scan_stream(bundle, pairs, chunk_size=args.chunk_size, range_factor=range_factor))
 
     def by_score(anomaly: dict) -> float:
         return anomaly["anomaly_score"]
@@ -218,6 +234,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         "detected_format": stats.detected_format,
         "anomalies_found": found,
         "anomalies_reported": len(anomalies),
+        "range_factor": range_factor,
     }
 
     if args.webhook_url:
@@ -238,10 +255,12 @@ def cmd_scan(args: argparse.Namespace) -> int:
         # Request data is attacker-controlled: escape control characters so a
         # logged request can't smuggle ANSI escape sequences into the terminal.
         for a in anomalies:
-            lines.append(
-                f"[line {a['line_number']}] score={a['anomaly_score']:.4f} ip={printable(a['ip'])} "
-                f"status={a['status']} path={printable(a['path'])}"
-            )
+            line = (f"[line {a['line_number']}] score={a['anomaly_score']:.4f} ip={printable(a['ip'])} "
+                    f"status={a['status']} path={printable(a['path'])}")
+            range_reasons = [reason for reason in a["reasons"] if reason != "isolation forest"]
+            if range_reasons:
+                line += "  <- " + "; ".join(range_reasons)
+            lines.append(line)
         rendered = "\n".join(lines)
 
     if args.output:
@@ -287,6 +306,12 @@ def build_parser() -> argparse.ArgumentParser:
     fit_parser.add_argument("--max-fit-rows", type=_positive_int, default=DEFAULT_MAX_FIT_ROWS, metavar="N",
                             help="Train on a uniform random sample of at most N baseline rows; bounds memory "
                                  "on huge baselines (default: %(default)s).")
+    fit_parser.add_argument("--range-factor", type=_range_factor, default=None, metavar="X",
+                            help="Also flag requests whose URL length, parameter count or response size is more "
+                                 "than X times the baseline's maximum (its 99.9th percentile) - the forest alone "
+                                 "can't tell how far beyond the baseline a value is. Stored in the model "
+                                 f"(default: {DEFAULT_RANGE_FACTOR:g}, or the existing model's value with --update; "
+                                 "0 turns the check off).")
     fit_parser.set_defaults(func=cmd_fit)
 
     scan_parser = subparsers.add_parser("scan", parents=[common], help="Scan a target log file for anomalies.")
@@ -297,6 +322,8 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Rows scored per batch; bounds memory on huge logs (default: %(default)s).")
     scan_parser.add_argument("--top", type=_positive_int, default=None, metavar="N",
                              help="Report only the N highest-scoring anomalies (all are still counted).")
+    scan_parser.add_argument("--range-factor", type=_range_factor, default=None, metavar="X",
+                             help="Override the model's range factor for this scan (0 turns the check off).")
     scan_parser.add_argument("--webhook-url", type=_webhook_url, default=os.environ.get(WEBHOOK_URL_ENV) or None,
                              metavar="URL",
                              help="POST a Slack-compatible summary here on completion. Prefer setting "

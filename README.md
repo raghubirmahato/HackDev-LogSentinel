@@ -33,6 +33,10 @@ payloads, or unusually shaped requests that stand out from the baseline. It uses
 - **Webhook alerting** (`scan --webhook-url` or `$LOGSENTINEL_WEBHOOK_URL`): posts a Slack-compatible
   summary. Log-derived text is escaped so a crafted request can't ping `@channel` or plant links, the
   webhook URL is never written to logs, and a failed webhook never aborts the scan.
+- **Range check for extreme values**: Isolation Forest can't tell *how far* beyond the baseline a
+  value is — a 300,000-character URL scores exactly like the longest URL in the baseline. So every
+  model also learns the baseline's maximum URL length, parameter count and response size, and flags
+  requests beyond `--range-factor` times that (2× by default), with the reason in the report.
 - Per-request feature extraction: URL length, query parameter count, special-character ratio,
   Shannon entropy of the query string, response payload size, HTTP method encoded as an integer.
 - Text and JSON output with a stats summary; `--top N` keeps only the highest-scoring anomalies.
@@ -80,6 +84,14 @@ Total: 30  Parsed: 30  Unparsed: 0  Anomalies: 3
 [line 24] score=0.0111 ip=203.0.113.9 status=500 path=/products?id=1'%20OR%20'1'='1
 ```
 
+Requests far larger than anything in the baseline are flagged by the range check, with the reason
+shown. Neither of these is flagged by the Isolation Forest alone:
+
+```
+[line 2] score=0.0408 ip=198.51.100.23 status=200 path=/index.html  <- payload_length=26000 is 2.7x its baseline maximum (9797)
+[line 1] score=0.0254 ip=198.51.100.23 status=404 path=/images/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.png  <- url_length=162 is 2.4x its baseline maximum (67.91)
+```
+
 Incrementally update an existing model with newer baseline data instead of refitting from scratch
 (rewriting the model in place is safe — it is saved atomically):
 
@@ -110,7 +122,8 @@ logsentinel scan access.w3c.gz --model baseline_model.joblib --format-override w
 {
   "stats": {
     "total_lines": 30, "parsed": 30, "unparsed": 0,
-    "detected_format": "combined", "anomalies_found": 3, "anomalies_reported": 3
+    "detected_format": "combined", "anomalies_found": 3, "anomalies_reported": 3,
+    "range_factor": 2.0
   },
   "anomalies": [
     {
@@ -119,6 +132,7 @@ logsentinel scan access.w3c.gz --model baseline_model.joblib --format-override w
       "path": "/products?id=1%20UNION%20SELECT%20username,password%20FROM%20users--",
       "status": 500,
       "anomaly_score": 0.059023,
+      "reasons": ["isolation forest"],
       "features": {
         "url_length": 68, "param_count": 1, "special_char_ratio": 0.161765,
         "entropy": 4.651975, "payload_length": 480, "method_encoded": 0
@@ -129,8 +143,12 @@ logsentinel scan access.w3c.gz --model baseline_model.joblib --format-override w
 }
 ```
 
-`anomaly_score` is the negated Isolation Forest decision function: anything above 0 is flagged, and
-higher means more anomalous.
+`anomaly_score` is the larger of two scores: the negated Isolation Forest decision function, and the
+range check's score (0.1 per doubling beyond the allowed range). Anything above 0 is flagged, higher
+means more anomalous, and `reasons` lists which check fired: `"isolation forest"`, or e.g.
+`"url_length=311 is 4.6x its baseline maximum (67.91)"`. The "baseline maximum" is the 99.9th
+percentile (at least 1), so a few attacks hidden in the baseline don't raise the bar; the response-size
+check is skipped when the baseline log records no sizes.
 
 ## Supported log formats
 
@@ -155,6 +173,7 @@ reporting a false "0 anomalies".
 | `--model` | `scan` | Path to a model bundle saved by `fit` (required) |
 | `--contamination` | `fit` | Expected proportion of anomalies in the baseline, in (0, 0.5] (default `0.05`; with `--update`, the existing model's value) |
 | `--max-fit-rows N` | `fit` | Train on a uniform random sample of at most N baseline rows (default `100000`) |
+| `--range-factor X` | `fit`, `scan` | Flag URL length, parameter count or response size beyond X times the baseline maximum. `fit`: stored in the model (default `2`; with `--update`, the existing model's value). `scan`: override for this scan. `0` turns the check off |
 | `--format {text,json}` | `fit`, `scan` | Output format (default `text`) |
 | `--format-override {combined,json,w3c}` | `fit`, `scan` | Force a log format instead of auto-detecting |
 | `--field-map JSON` | `fit`, `scan` | Field-name mapping for the JSON log format (dotted keys for nested objects) |
@@ -166,6 +185,20 @@ reporting a false "0 anomalies".
 
 Exit status: `0` success, `1` error (missing/corrupt files, nothing parsable), `2` invalid
 arguments, `130` interrupted.
+
+## Model compatibility
+
+Model files from every release work with every other release:
+
+| Model file saved by | Loaded by 2.2 | Loaded by 2.0 / 2.1 |
+|---|---|---|
+| 2.0 or 2.1 | Yes, with the range check — its bounds are derived from the baseline sample stored in the model | Yes |
+| 2.2 | Yes | Yes, without the range check (those releases don't have it) |
+
+`fit --update` works across releases too; no model needs to be re-fitted. (An update made with 2.0
+or 2.1 doesn't carry over a custom `--range-factor`; 2.2 then uses the default.) Models are pickles of
+scikit-learn objects, so load them with the same scikit-learn version they were saved with
+(scikit-learn warns otherwise).
 
 ## Security notes
 
@@ -202,8 +235,10 @@ ruff check .
 The suite covers each parser against realistic fixture lines (including hostile and malformed
 input: evasion attempts, crafted URLs, pathological JSON, truncated gzip files), format
 auto-detection, a 50,000-line synthetic log for the streaming scan, statistical checks that the
-bounded-memory sampler is unbiased and that incremental updates weight history correctly, model
-save/load validation (corrupt, incompatible and interrupted saves), the CLI end to end (exit codes,
+bounded-memory sampler is unbiased and that incremental updates weight history correctly, the range
+check (limits, scoring, and that the forest alone scores a 69- and a 300,000-character URL
+identically), model save/load validation (corrupt, incompatible and interrupted saves, and model files
+in every earlier release's format), the CLI end to end (exit codes,
 output formats, usage errors), and webhook posting with a mocked endpoint — including that the
 webhook secret never reaches the logs. ML-dependent tests use `pytest.importorskip("sklearn")` to
 skip gracefully if scikit-learn isn't installed. CI runs the suite on Python 3.10–3.14.

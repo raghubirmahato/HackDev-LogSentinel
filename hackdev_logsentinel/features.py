@@ -18,6 +18,11 @@ FEATURE_ORDER = (
     "payload_length", "method_encoded",
 )
 
+# Non-negative, unbounded features for which "far larger than anything in the
+# baseline" is itself suspicious. IsolationForest can't express that - see
+# scan_stream() in model.py - so the detector range-checks these explicitly.
+MAGNITUDE_FEATURES = ("url_length", "param_count", "payload_length")
+
 
 @dataclass
 class RequestFeatures:

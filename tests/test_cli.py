@@ -39,7 +39,8 @@ def _scan_json(capsys, *argv) -> dict:
 def test_scan_sample_log_flags_the_attacks(sample_model, capsys):
     result = _scan_json(capsys, SAMPLE_LOG, "--model", sample_model)
     assert result["stats"] == {"total_lines": 30, "parsed": 30, "unparsed": 0, "detected_format": "combined",
-                               "anomalies_found": 3, "anomalies_reported": 3}
+                               "anomalies_found": 3, "anomalies_reported": 3, "range_factor": 2.0}
+    assert all(a["reasons"] == ["isolation forest"] for a in result["anomalies"])
     flagged = [a["line_number"] for a in result["anomalies"]]
     assert set(flagged) <= ATTACK_LINES
     scores = [a["anomaly_score"] for a in result["anomalies"]]
@@ -163,6 +164,10 @@ def test_field_map_warning_for_non_json_logs(sample_model, capsys, caplog):
     ["--contamination", "0"],
     ["--contamination", "abc"],
     ["--max-fit-rows", "0"],
+    ["--range-factor", "1"],
+    ["--range-factor", "-2"],
+    ["--range-factor", "inf"],
+    ["--range-factor", "abc"],
     ["--field-map", '["ip"]'],
     ["--field-map", '{"ipaddr": "x"}'],
     ["--field-map", '{"ip": ""}'],
@@ -174,7 +179,8 @@ def test_fit_usage_errors_fail_fast(extra, tmp_path):
     assert excinfo.value.code == 2
 
 
-@pytest.mark.parametrize("extra", [["--chunk-size", "0"], ["--top", "-1"], ["--webhook-url", "ftp://x/SECRETTOKEN"]])
+@pytest.mark.parametrize("extra", [["--chunk-size", "0"], ["--top", "-1"], ["--range-factor", "0.5"],
+                                   ["--webhook-url", "ftp://x/SECRETTOKEN"]])
 def test_scan_usage_errors_fail_fast(extra, sample_model, capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["scan", str(SAMPLE_LOG), "--model", str(sample_model), *extra])
@@ -242,3 +248,52 @@ def test_entrypoints_report_version(entrypoint):
     result = subprocess.run([sys.executable, *entrypoint, "--version"], capture_output=True, text=True,
                             cwd=REPO_ROOT, check=True)
     assert result.stdout.strip() == f"logsentinel {__version__}"
+
+
+def _long_path_log(tmp_path, length=311):
+    target = tmp_path / "long.jsonl"
+    path = "/" + "A" * (length - 1)
+    target.write_text(json.dumps({"ip": "6.6.6.6", "path": path, "status": 200, "size": 2000}) + "\n")
+    return target
+
+
+def test_path_longer_than_anything_in_the_baseline_is_flagged(sample_model, tmp_path, capsys):
+    # The demo baseline's longest URL is 68 characters; the forest alone scored this as normal.
+    target = _long_path_log(tmp_path)
+    result = _scan_json(capsys, target, "--model", sample_model)
+    assert result["stats"]["anomalies_found"] == 1
+    assert result["anomalies"][0]["reasons"] == ["url_length=311 is 4.6x its baseline maximum (67.91)"]
+
+    assert main(["scan", str(target), "--model", str(sample_model)]) == 0
+    assert "<- url_length=311 is 4.6x its baseline maximum (67.91)" in capsys.readouterr().out
+
+    assert _scan_json(capsys, target, "--model", sample_model, "--range-factor", "0")["stats"]["anomalies_found"] == 0
+
+
+def test_fit_reports_range_bounds(tmp_path, capsys):
+    assert main(["fit", str(SAMPLE_LOG), "-o", str(tmp_path / "m.joblib"), "--format", "json"]) == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["range_factor"] == 2.0
+    assert summary["range_bounds"] == {"url_length": pytest.approx(67.913), "param_count": 2.0,
+                                       "payload_length": pytest.approx(9796.901)}
+
+
+def test_range_factor_is_stored_and_inherited_by_updates(tmp_path, capsys):
+    model = tmp_path / "m.joblib"
+    assert main(["fit", str(SAMPLE_LOG), "-o", str(model), "--contamination", "0.1", "--range-factor", "5"]) == 0
+    assert main(["fit", str(SAMPLE_LOG), "--update", str(model), "-o", str(model)]) == 0
+    capsys.readouterr()  # discard the fit summaries
+    assert joblib.load(model)["range_factor"] == 5.0
+    target = _long_path_log(tmp_path, length=311)  # 4.6x the baseline: under 5x
+    assert _scan_json(capsys, target, "--model", model)["stats"]["anomalies_found"] == 0
+    assert _scan_json(capsys, target, "--model", model, "--range-factor", "4")["stats"]["anomalies_found"] == 1
+
+
+def test_model_from_an_older_release_gets_the_range_check(sample_model, tmp_path, capsys):
+    # A model file exactly as LogSentinel 2.0 wrote it: no metadata, no range bounds.
+    current = joblib.load(sample_model)
+    old = tmp_path / "v2.0.joblib"
+    joblib.dump({key: current[key] for key in ("model", "scaler", "feature_order", "cached_sample")}, old)
+    result = _scan_json(capsys, _long_path_log(tmp_path), "--model", old)
+    assert result["anomalies"][0]["reasons"] == ["url_length=311 is 4.6x its baseline maximum (67.91)"]
+    assert _scan_json(capsys, SAMPLE_LOG, "--model", old)["stats"]["anomalies_found"] == 3

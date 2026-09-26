@@ -1,4 +1,5 @@
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from hackdev_logsentinel import model as model_module  # noqa: E402
 from hackdev_logsentinel.features import FEATURE_ORDER, extract_features  # noqa: E402
 from hackdev_logsentinel.model import (  # noqa: E402
     BUNDLE_FORMAT_VERSION,
+    DEFAULT_RANGE_FACTOR,
     EmptyBaselineError,
     ModelBundle,
     ModelError,
@@ -241,7 +243,8 @@ def test_scan_results_do_not_depend_on_chunk_size(tmp_path, baseline_bundle):
     _write_anomalous_log(anomalous)
     with target.open("a") as fh:
         fh.write(anomalous.read_text())
-    results =[list(scan_stream(baseline_bundle, _pairs(target), chunk_size=size)) for size in (1, 7, 2000)]
+        fh.write(f'10.0.0.7 - - [10/Oct/2023:14:00:02 -0700] "GET /{"x" * 400} HTTP/1.1" 200 500 "-" "M"\n')
+    results = [list(scan_stream(baseline_bundle, _pairs(target), chunk_size=size)) for size in (1, 7, 2000)]
     assert results[0] == results[1] == results[2]
     assert results[0], "expected at least one anomaly"
 
@@ -253,8 +256,8 @@ def test_scan_flags_exactly_what_predict_flags(tmp_path, baseline_bundle):
     matrix = np.array([extract_features(e).to_vector() for e in entries])
     predicted = baseline_bundle.model.predict(baseline_bundle.scaler.transform(matrix))
     expected = {e.line_number for e, p in zip(entries, predicted, strict=True) if p == -1}
-    flagged = {a["line_number"] for a in scan_stream(baseline_bundle, _pairs(target), chunk_size=64)}
-    assert flagged == expected
+    pure_forest = scan_stream(baseline_bundle, _pairs(target), chunk_size=64, range_factor=0)
+    assert {a["line_number"] for a in pure_forest} == expected
 
 
 def test_scan_boundary_matches_predict_semantics():
@@ -344,3 +347,197 @@ def test_load_bundle_rejects_incompatible_features_and_newer_formats(tmp_path, b
     joblib.dump({**base, "format_version": BUNDLE_FORMAT_VERSION + 1}, tmp_path / "newer.joblib")
     with pytest.raises(ModelError, match="newer"):
         load_bundle(tmp_path / "newer.joblib")
+
+
+# ---------------------------------------------------------------------------
+# Range check: values far beyond anything in the baseline
+# ---------------------------------------------------------------------------
+
+SAMPLE_LOG = Path(__file__).resolve().parent.parent / "sample_access.log"
+
+
+def _request(path="/", size=2000):
+    return LogEntry(1, "6.6.6.6", "", "GET", path, "1.1", 200, size, "", "", "")
+
+
+def _scan_one(bundle, entry, **kwargs):
+    return list(scan_stream(bundle, [(entry, extract_features(entry))], **kwargs))
+
+
+class _NeverAnomalousForest:
+    contamination = 0.1
+
+    def decision_function(self, matrix):
+        return np.ones(len(matrix))
+
+
+class _Identity:
+    def transform(self, matrix):
+        return matrix
+
+
+def _range_only(bounds, factor=DEFAULT_RANGE_FACTOR):
+    """A bundle whose forest never flags anything, to test the range check alone."""
+    return ModelBundle(model=_NeverAnomalousForest(), scaler=_Identity(), feature_order=FEATURE_ORDER,
+                       cached_sample=None, range_bounds=bounds, range_factor=factor)
+
+
+@pytest.fixture(scope="module")
+def demo_bundle():
+    return fit_model(_features(SAMPLE_LOG), contamination=0.1)
+
+
+def test_isolation_forest_alone_cannot_see_how_far_out_a_value_is(demo_bundle):
+    # Why the range check exists: every split is drawn inside the training
+    # range, so any url_length past the baseline's longest (68) scores the same.
+    def forest_score(length):
+        vector = extract_features(_request("/" + "a" * (length - 1))).to_vector()
+        return -demo_bundle.model.decision_function(demo_bundle.scaler.transform([vector]))[0]
+
+    assert forest_score(69) == forest_score(311) == forest_score(300_000)
+
+
+def test_path_far_longer_than_anything_in_the_baseline_is_flagged(demo_bundle):
+    (hit,) = _scan_one(demo_bundle, _request("/" + "A" * 310))
+    assert hit["anomaly_score"] > 0
+    assert hit["reasons"] == ["url_length=311 is 4.6x its baseline maximum (67.91)"]
+    assert _scan_one(demo_bundle, _request("/" + "A" * 99)) == []  # 1.5x the baseline: within tolerance
+
+
+def test_range_score_grows_with_distance(demo_bundle):
+    scores = [_scan_one(demo_bundle, _request("/" + "a" * (n - 1)))[0]["anomaly_score"] for n in (200, 2_000, 20_000)]
+    assert scores[0] < scores[1] < scores[2]
+
+
+def test_range_limit_is_factor_times_bound():
+    bundle = _range_only({"url_length": 100.0, "param_count": 1.0, "payload_length": 5000.0})
+    assert _scan_one(bundle, _request("/" + "a" * 199)) == []  # 200 == 2 x 100
+    (hit,) = _scan_one(bundle, _request("/" + "a" * 200))
+    assert hit["reasons"] == ["url_length=201 is 2.0x its baseline maximum (100)"]
+    assert 0 < hit["anomaly_score"] < 0.001
+    assert _scan_one(bundle, _request("/?a=1&b=2")) == []  # 2 params == 2 x 1
+    assert _scan_one(bundle, _request("/?a=1&b=2&c=3"))[0]["reasons"] == [
+        "param_count=3 is 3.0x its baseline maximum (1)"]
+    assert _scan_one(bundle, _request(size=10_001))[0]["reasons"] == [
+        "payload_length=10001 is 2.0x its baseline maximum (5000)"]
+
+
+def test_range_check_off_by_factor_zero_or_per_feature():
+    bounds = {"url_length": 10.0, "param_count": 1.0, "payload_length": None}
+    assert _scan_one(_range_only(bounds, factor=0), _request("/" + "a" * 5000)) == []
+    bundle = _range_only(bounds)
+    assert _scan_one(bundle, _request("/" + "a" * 5000))
+    assert _scan_one(bundle, _request("/" + "a" * 5000), range_factor=0) == []  # per-scan override
+    assert _scan_one(bundle, _request("/" + "a" * 40), range_factor=5) == []  # 41 < 5 x 10
+    assert _scan_one(bundle, _request(size=10**12)) == []  # no size bound: the log never recorded sizes
+
+
+def test_flagged_rows_never_show_a_zero_score():
+    bundle = _range_only({"url_length": 1000.0, "param_count": 1.0, "payload_length": 1e12})
+    (hit,) = _scan_one(bundle, _request(size=2 * 10**12 + 1))  # over the limit by a hair
+    assert hit["anomaly_score"] == 1e-06
+
+
+def test_range_bounds_learned_from_the_baseline():
+    rng = np.random.default_rng(0)
+    rows = np.zeros((10_000, len(FEATURE_ORDER)))
+    rows[:, 0] = np.r_[rng.integers(20, 61, 9_995), [5_000] * 5]  # 5 attacks hidden in the baseline
+    bounds = model_module._range_bounds(rows)
+    assert bounds["url_length"] == 60.0  # the 99.9th percentile ignores the planted attacks
+    assert bounds["param_count"] == 1.0  # always 0 (no query strings): floor of 1 keeps the check useful
+    assert bounds["payload_length"] is None  # sizes never recorded: nothing to compare against
+    rows[:, 4] = rng.integers(100, 5_000, 10_000)
+    assert 4_900 < model_module._range_bounds(rows)["payload_length"] < 5_000
+
+
+def test_update_recomputes_bounds_and_keeps_or_overrides_range_factor(tmp_path, baseline_bundle):
+    longer = tmp_path / "longer.log"
+    longer.write_text("".join(
+        f'10.0.0.{i} - - [10/Oct/2023:13:00:00 -0700] '
+        f'"GET /catalog/item-{i:04d}/details.html HTTP/1.1" 200 800 "-" "M"\n'
+        for i in range(300)
+    ))
+    custom = replace(baseline_bundle, range_factor=3.0)
+    updated = fit_incremental(custom, _features(longer))
+    assert updated.range_factor == 3.0
+    assert updated.range_bounds["url_length"] > baseline_bundle.range_bounds["url_length"]
+    assert fit_incremental(custom, _features(longer), range_factor=0).range_factor == 0
+
+
+def test_invalid_range_factor_rejected_before_reading_the_stream():
+    for bad in (1, 0.5, -2, float("inf"), float("nan"), "2", True):
+        with pytest.raises(ValueError, match="range_factor"):
+            fit_model(iter([]), contamination=0.1, range_factor=bad)
+
+
+# ---------------------------------------------------------------------------
+# Compatibility of model files across releases
+# ---------------------------------------------------------------------------
+
+
+def _release_bundle(bundle, release):
+    """A bundle dict exactly as LogSentinel `release` wrote it."""
+    data = {"model": bundle.model, "scaler": bundle.scaler, "feature_order": list(FEATURE_ORDER),
+            "cached_sample": bundle.cached_sample}
+    if release == "2.1":
+        data.update(format_version=2, logsentinel_version="2.1.0", n_samples_seen=bundle.n_samples_seen)
+    return data
+
+
+@pytest.mark.parametrize("release", ["2.0", "2.1"])
+def test_models_from_older_releases_get_the_range_check(tmp_path, baseline_bundle, release):
+    path = tmp_path / f"{release}.joblib"
+    joblib.dump(_release_bundle(baseline_bundle, release), path)
+    loaded = load_bundle(path)
+    assert loaded.range_bounds == model_module._range_bounds(baseline_bundle.cached_sample)
+    assert loaded.range_factor == DEFAULT_RANGE_FACTOR
+    (hit,) = _scan_one(loaded, _request("/" + "a" * 1999))
+    assert any(reason.startswith("url_length=2000 ") for reason in hit["reasons"])
+
+
+def test_range_settings_round_trip(tmp_path, baseline_bundle):
+    custom = replace(baseline_bundle, range_factor=np.float64(3.5),
+                     range_bounds={"url_length": np.float64(500.0), "param_count": 3, "payload_length": None})
+    save_bundle(custom, tmp_path / "m.joblib")
+    loaded = load_bundle(tmp_path / "m.joblib")
+    assert (loaded.range_bounds, loaded.range_factor) == (custom.range_bounds, 3.5)
+    # Stored as plain Python floats: numpy scalar pickles don't load across numpy 1.x / 2.x.
+    raw = joblib.load(tmp_path / "m.joblib")
+    assert type(raw["range_factor"]) is float
+    assert [type(raw["range_bounds"][name]) for name in ("url_length", "param_count")] == [float, float]
+
+
+def test_new_models_stay_readable_by_older_releases(tmp_path, baseline_bundle):
+    # 2.0 and 2.1 read only these keys, and 2.1 rejects format versions above 2.
+    # The range settings are extra keys holding plain Python values, which both
+    # ignore (they scan without the range check).
+    save_bundle(baseline_bundle, tmp_path / "m.joblib")
+    raw = joblib.load(tmp_path / "m.joblib")
+    assert raw["format_version"] == 2
+    assert {"model", "scaler", "feature_order", "cached_sample", "n_samples_seen"} <= set(raw)
+    assert type(raw["range_factor"]) is float
+    assert all(bound is None or type(bound) is float for bound in raw["range_bounds"].values())
+
+
+def test_missing_bounds_are_completed_from_the_cached_sample(tmp_path, baseline_bundle):
+    data = {**_release_bundle(baseline_bundle, "2.1"), "range_bounds": {"url_length": 999.0}}
+    joblib.dump(data, tmp_path / "partial.joblib")
+    loaded = load_bundle(tmp_path / "partial.joblib")
+    derived = model_module._range_bounds(baseline_bundle.cached_sample)
+    assert loaded.range_bounds == {**derived, "url_length": 999.0}
+
+
+@pytest.mark.parametrize("field, value", [
+    ("range_bounds", ["not", "a", "dict"]),
+    ("range_bounds", {"url_length": -1.0}),
+    ("range_bounds", {"url_length": float("nan")}),
+    ("range_bounds", {"url_length": float("inf")}),
+    ("range_bounds", {"url_length": "long"}),
+    ("range_factor", 1.0),
+    ("range_factor", "2"),
+    ("range_factor", float("inf")),
+])
+def test_invalid_range_settings_in_a_model_file_are_rejected(tmp_path, baseline_bundle, field, value):
+    joblib.dump({**_release_bundle(baseline_bundle, "2.1"), field: value}, tmp_path / "bad.joblib")
+    with pytest.raises(ModelError):
+        load_bundle(tmp_path / "bad.joblib")

@@ -37,10 +37,12 @@ def build_webhook_payload(target_log_file: str, stats: dict, anomalies: list[dic
     ]
     shown = anomalies[:MAX_LISTED_ANOMALIES]
     for anomaly in shown:
-        lines.append(
-            f"- line {anomaly['line_number']}: score={anomaly['anomaly_score']:.3f} "
-            f"ip={_slack_text(anomaly['ip'])} path={_slack_text(anomaly['path'])}"
-        )
+        line = (f"- line {anomaly['line_number']}: score={anomaly['anomaly_score']:.3f} "
+                f"ip={_slack_text(anomaly['ip'])} path={_slack_text(anomaly['path'])}")
+        range_reasons = [r for r in anomaly.get("reasons", []) if r != "isolation forest"]
+        if range_reasons:
+            line += " (" + _slack_text("; ".join(range_reasons)) + ")"
+        lines.append(line)
     # `anomalies` may be only the top-N of a larger set (scan --top).
     remaining = max(len(anomalies), stats.get("anomalies_found", 0)) - len(shown)
     if remaining > 0:

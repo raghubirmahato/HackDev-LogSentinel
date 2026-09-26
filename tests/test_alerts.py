@@ -107,3 +107,13 @@ def test_webhook_without_requests_installed_is_skipped(caplog):
         with caplog.at_level(logging.WARNING):
             assert post_webhook(SECRET_URL, {"text": "hi"}) is False
     assert "SECRETTOKEN" not in caplog.text
+
+
+def test_payload_explains_range_hits():
+    anomalies = [
+        {**_anomaly(line=1), "reasons": ["url_length=311 is 4.6x its baseline maximum (67.91)"]},
+        {**_anomaly(line=2), "reasons": ["isolation forest"]},
+    ]
+    lines = build_webhook_payload("t.log", {"parsed": 2, "anomalies_found": 2}, anomalies)["text"].split("\n")
+    assert lines[2].endswith("(url_length=311 is 4.6x its baseline maximum (67.91))")
+    assert lines[3].endswith("path=/x")  # forest-only hits keep the plain format
